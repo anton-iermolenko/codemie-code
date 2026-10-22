@@ -318,6 +318,8 @@ When the remote MCP server requires authentication, the proxy handles it automat
 6. **Token exchange** — exchange the code for access/refresh tokens
 7. **Retry** — replay the original request with the Bearer token
 
+When several MCP servers start together, their proxies take turns: a lock file (`~/.codemie/mcp-auth.lock`) lets only one browser login be in flight at a time, because concurrent logins in one browser can invalidate each other. After the initial login, an expired or rejected access token is renewed in place — silently with the refresh token when one is held in memory, otherwise through the browser — without dropping the server from the session.
+
 All tokens and client state are kept in-memory only — re-authorization is required each session.
 
 ### SSO Integration
