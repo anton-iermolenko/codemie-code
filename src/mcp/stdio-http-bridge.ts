@@ -14,7 +14,6 @@
  */
 
 import {
-  OAuthError,
   StreamableHTTPClientTransport,
   UnauthorizedError,
   auth,
@@ -103,7 +102,7 @@ export class StdioHttpBridge {
 
   constructor(options: BridgeOptions) {
     this.serverUrl = new URL(options.serverUrl);
-    this.oauthProvider = new McpOAuthProvider();
+    this.oauthProvider = new McpOAuthProvider(this.serverUrl);
     this.stdioTransport = new StdioServerTransport();
     log(`[mcp-proxy] Bridge created for ${this.serverUrl}`);
   }
@@ -176,6 +175,18 @@ export class StdioHttpBridge {
    */
   private async connectHttpTransport(): Promise<void> {
     log(`[mcp-proxy] Connecting to MCP server: ${this.serverUrl}`);
+
+    // A login from an earlier run: reuse it, renewing the access token first if it has lapsed.
+    // If that is not possible, drop the stale token and log in as usual.
+    this.oauthProvider.restorePersistedLogin();
+    if (this.oauthProvider.tokenNeedsRenewal()) {
+      if (await this.oauthProvider.renewSilently()) {
+        log('[mcp-proxy] Restored login renewed with the refresh token');
+      } else {
+        log('[mcp-proxy] Restored login could not be renewed, a login is required');
+        this.oauthProvider.discardTokens();
+      }
+    }
 
     await this.oauthProvider.ensureCallbackServer();
     log('[mcp-proxy] Callback server pre-started');
@@ -329,8 +340,8 @@ export class StdioHttpBridge {
   }
 
   /**
-   * Renew the access token after the initial connect: silently with a refresh token if one is
-   * held in memory, otherwise through the browser. Concurrent callers share one attempt.
+   * Renew the access token after the initial connect: silently with the refresh token if there is
+   * one, otherwise through the browser. Concurrent callers share one attempt.
    */
   private reauthenticate(): Promise<void> {
     this.reauthenticating ??= this.runReauthentication().finally(() => {
@@ -340,23 +351,18 @@ export class StdioHttpBridge {
   }
 
   private async runReauthentication(): Promise<void> {
-    await this.oauthProvider.prepareReauthentication();
-
-    const authenticate = (): Promise<AuthResult> =>
-      auth(this.oauthProvider, { serverUrl: this.serverUrl, fetchFn: this.cookieFetch });
-
-    let result: AuthResult;
-    try {
-      result = await authenticate();
-    } catch (error) {
-      // A refresh the server refused (revoked or expired refresh token, or a re-registered
-      // client): fall back to a full login instead of giving up
-      if (!(error instanceof OAuthError)) throw error;
-      log(`[mcp-proxy] Silent token renewal failed, falling back to browser login:\n${errorDetail(error)}`);
-      this.oauthProvider.invalidateCredentials('tokens');
-      result = await authenticate();
+    if (await this.oauthProvider.renewSilently(this.cookieFetch)) {
+      log('[mcp-proxy] Access token renewed with the refresh token');
+      return;
     }
 
+    // No refresh token, or the server refused it: log in through the browser. Without a token the
+    // SDK goes straight to the login instead of trying to refresh.
+    log('[mcp-proxy] Silent renewal not possible, logging in through the browser');
+    this.oauthProvider.discardTokens();
+    await this.oauthProvider.prepareReauthentication();
+
+    const result: AuthResult = await auth(this.oauthProvider, { serverUrl: this.serverUrl, fetchFn: this.cookieFetch });
     if (result === 'REDIRECT') {
       await this.handleOAuthFlow(this.httpTransport!);
     }
