@@ -9,14 +9,19 @@
  * demands its own login, so each gets its own file. One writer per file also means proxies that
  * start together never overwrite each other's state.
  *
- * Files live in ~/.codemie/mcp-auth (dir 0700, files 0600). They contain a refresh token, i.e. a
- * long-lived credential: treat them like ~/.ssh keys. MCP_PROXY_PERSIST_TOKENS=off disables reading
- * and writing; deleting the directory logs every endpoint out.
+ * Files live in ~/.codemie/mcp-auth (dir 0700, files 0600) as `<hash>.enc`. They contain a refresh
+ * token, i.e. a long-lived credential, so the content is encrypted with the same machine-bound
+ * AES-256-GCM key as the SSO/JWT credentials (credential-crypto.ts, see CredentialStore): a file that
+ * is copied off the machine by a backup, a sync tool or a support bundle is unreadable there. The key
+ * is derived from machine facts, not from a secret, so this does not protect against another process
+ * running as the same user. MCP_PROXY_PERSIST_TOKENS=off disables reading and writing; deleting the
+ * directory logs every endpoint out.
  */
 
 import { createHash } from 'crypto';
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { decryptWithKey, deriveMachineEncryptionKey, encryptWithKey } from '../../utils/credential-crypto.js';
 import { getCodemieHome } from '../../utils/paths.js';
 import { proxyLog } from '../proxy-logger.js';
 
@@ -62,11 +67,69 @@ function dir(): string {
 
 function pathFor(resource: URL): string {
   const name = createHash('sha256').update(resource.href).digest('hex').slice(0, 16);
-  return join(dir(), `${name}.json`);
+  return join(dir(), `${name}.enc`);
+}
+
+/** Where earlier revisions kept the same login, as plain JSON. */
+function legacyPathFor(resource: URL): string {
+  return pathFor(resource).replace(/\.enc$/, '.json');
 }
 
 function note(resource: URL, message: string): void {
   proxyLog(`[mcp-proxy][tokens] ${resource.href}: ${message}`);
+}
+
+function removeQuietly(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // already gone
+  }
+}
+
+/** Encrypt `json` into `path` atomically; throws on failure, never leaving a half-written file behind. */
+function writeEncrypted(path: string, json: string): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dir(), { recursive: true, mode: 0o700 });
+    chmodSync(dir(), 0o700); // mkdir's mode does not apply to a directory that already existed
+    writeFileSync(tmp, encryptWithKey(json, deriveMachineEncryptionKey()), { mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } catch (error) {
+    removeQuietly(tmp);
+    throw error;
+  }
+}
+
+/**
+ * Earlier revisions wrote `<hash>.json` in plain text. Encrypt such a login in place so nobody has to
+ * sign in to every server again, and never leave the plaintext behind. An existing encrypted file is
+ * newer than the legacy one, so it is kept and the legacy file is only deleted.
+ */
+function migrateLegacyLogin(resource: URL): void {
+  const legacy = legacyPathFor(resource);
+  let plain: string;
+  try {
+    plain = readFileSync(legacy, 'utf-8');
+  } catch {
+    return; // nothing to migrate
+  }
+  try {
+    JSON.parse(plain);
+  } catch {
+    removeQuietly(legacy); // not a usable login: just drop the plaintext
+    return;
+  }
+  try {
+    if (!existsSync(pathFor(resource))) {
+      writeEncrypted(pathFor(resource), plain);
+      note(resource, 'encrypted login saved by an earlier version');
+    }
+    removeQuietly(legacy);
+  } catch (error) {
+    note(resource, `could not migrate legacy login: ${error}`); // keep the legacy file: retried on the next load
+  }
 }
 
 /**
@@ -76,8 +139,12 @@ function note(resource: URL, message: string): void {
 export function loadPersistedLogin(resource: URL): PersistedLogin | undefined {
   if (!enabled()) return undefined;
 
+  migrateLegacyLogin(resource);
+
   try {
-    const data = JSON.parse(readFileSync(pathFor(resource), 'utf-8')) as PersistedFile;
+    const data = JSON.parse(
+      decryptWithKey(readFileSync(pathFor(resource), 'utf-8'), deriveMachineEncryptionKey()),
+    ) as PersistedFile;
     if (data.version !== FILE_VERSION || data.resource !== resource.href) return undefined;
 
     const grant: RenewalGrant | undefined =
@@ -103,7 +170,7 @@ export function loadPersistedLogin(resource: URL): PersistedLogin | undefined {
       grant,
     };
   } catch {
-    return undefined; // no file, or unreadable: log in as usual
+    return undefined; // no file, or unreadable (e.g. written on another machine): log in as usual
   }
 }
 
@@ -128,30 +195,17 @@ export function persistLogin(resource: URL, login: PersistedLogin): void {
     ...(login.grant ? { refresh_token: login.grant.refreshToken, client: login.grant.clientInfo } : {}),
   };
 
-  const path = pathFor(resource);
-  const tmp = `${path}.${process.pid}.tmp`;
   try {
-    mkdirSync(dir(), { recursive: true, mode: 0o700 });
-    chmodSync(dir(), 0o700); // mkdir's mode does not apply to a directory that already existed
-    writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 });
-    chmodSync(tmp, 0o600);
-    renameSync(tmp, path);
+    writeEncrypted(pathFor(resource), JSON.stringify(data));
+    removeQuietly(legacyPathFor(resource));
     note(resource, `persisted login (${login.grant ? 'with' : 'without'} refresh token)`);
   } catch (error) {
     note(resource, `could not persist login: ${error}`);
-    try {
-      unlinkSync(tmp); // never leave a half-written file holding a token behind
-    } catch {
-      // nothing to remove
-    }
   }
 }
 
 /** Drop the persisted login for `resource` (revoked, or refused by the server). */
 export function forgetPersistedLogin(resource: URL): void {
-  try {
-    unlinkSync(pathFor(resource));
-  } catch {
-    // already gone
-  }
+  removeQuietly(pathFor(resource));
+  removeQuietly(legacyPathFor(resource));
 }
