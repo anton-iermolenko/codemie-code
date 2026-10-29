@@ -9,14 +9,19 @@
  * demands its own login, so each gets its own file. One writer per file also means proxies that
  * start together never overwrite each other's state.
  *
- * Files live in ~/.codemie/mcp-auth (dir 0700, files 0600). They contain a refresh token, i.e. a
- * long-lived credential: treat them like ~/.ssh keys. MCP_PROXY_PERSIST_TOKENS=off disables reading
- * and writing; deleting the directory logs every endpoint out.
+ * Files live in ~/.codemie/mcp-auth (dir 0700, files 0600) as `<hash>.enc`. They contain a refresh
+ * token, i.e. a long-lived credential, so the content is encrypted with the same machine-bound
+ * AES-256-GCM key as the SSO/JWT credentials (credential-crypto.ts, see CredentialStore): a file that
+ * is copied off the machine by a backup, a sync tool or a support bundle is unreadable there. The key
+ * is derived from machine facts, not from a secret, so this does not protect against another process
+ * running as the same user. MCP_PROXY_PERSIST_TOKENS=off disables reading and writing; deleting the
+ * directory logs every endpoint out.
  */
 
 import { createHash } from 'crypto';
 import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { decryptWithKey, deriveMachineEncryptionKey, encryptWithKey } from '../../utils/credential-crypto.js';
 import { getCodemieHome } from '../../utils/paths.js';
 import { proxyLog } from '../proxy-logger.js';
 
@@ -62,7 +67,7 @@ function dir(): string {
 
 function pathFor(resource: URL): string {
   const name = createHash('sha256').update(resource.href).digest('hex').slice(0, 16);
-  return join(dir(), `${name}.json`);
+  return join(dir(), `${name}.enc`);
 }
 
 function note(resource: URL, message: string): void {
@@ -77,7 +82,9 @@ export function loadPersistedLogin(resource: URL): PersistedLogin | undefined {
   if (!enabled()) return undefined;
 
   try {
-    const data = JSON.parse(readFileSync(pathFor(resource), 'utf-8')) as PersistedFile;
+    const data = JSON.parse(
+      decryptWithKey(readFileSync(pathFor(resource), 'utf-8'), deriveMachineEncryptionKey()),
+    ) as PersistedFile;
     if (data.version !== FILE_VERSION || data.resource !== resource.href) return undefined;
 
     const grant: RenewalGrant | undefined =
@@ -103,7 +110,7 @@ export function loadPersistedLogin(resource: URL): PersistedLogin | undefined {
       grant,
     };
   } catch {
-    return undefined; // no file, or unreadable: log in as usual
+    return undefined; // no file, or unreadable (e.g. written on another machine): log in as usual
   }
 }
 
@@ -133,7 +140,7 @@ export function persistLogin(resource: URL, login: PersistedLogin): void {
   try {
     mkdirSync(dir(), { recursive: true, mode: 0o700 });
     chmodSync(dir(), 0o700); // mkdir's mode does not apply to a directory that already existed
-    writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 });
+    writeFileSync(tmp, encryptWithKey(JSON.stringify(data), deriveMachineEncryptionKey()), { mode: 0o600 });
     chmodSync(tmp, 0o600);
     renameSync(tmp, path);
     note(resource, `persisted login (${login.grant ? 'with' : 'without'} refresh token)`);
